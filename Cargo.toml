@@ -1,0 +1,24 @@
+[package]
+name = "camscrub"
+version = "0.1.0"
+authors = ["Xentec <xentec@aix0.eu>"]
+edition = "2018"
+
+[dependencies]
+structopt = { version = "^0.3", default-features = false }
+anyhow = "^1.0"
+indicatif = "^0.16"
+
+# I/O
+futures-util = "^0.3"
+tokio = { version = "^1", features = ["io-util", "io-std","fs","time"] }
+tokio-stream = "^0.1"
+reqwest = { version = "^0.11", default-features = false, features = ["json","brotli","gzip","stream","trust-dns", "rustls-tls"] }
+
+# Data processing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "^0.4", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
