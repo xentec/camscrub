@@ -2,18 +2,25 @@
 name = "camscrub"
 version = "0.1.0"
 authors = ["Xentec <xentec@aix0.eu>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-structopt = { version = "^0.3", default-features = false }
+# Quality of Life
 anyhow = "^1.0"
+
+# Interface
+clap = { version = "^3", default-features = false, features = ["std", "derive"] }
 indicatif = "^0.16"
 
 # I/O
 futures-util = "^0.3"
-tokio = { version = "^1", features = ["io-util", "io-std","fs","time"] }
+async-channel = "^1.6"
+tokio = { version = "^1.18", features = ["rt-multi-thread", "io-util", "io-std","fs","time"] }
 tokio-stream = "^0.1"
 reqwest = { version = "^0.11", default-features = false, features = ["json","brotli","gzip","stream","trust-dns", "rustls-tls"] }
+
+# System
+nix = { version = "^0.24", features = ["fs"] }
 
 # Data processing
 serde = { version = "1", features = ["derive"] }

@@ -1,7 +1,15 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use std::{collections::BTreeSet, path::Path, str::FromStr};
+use std::{
+	collections::BTreeSet,
+	path::{Path, PathBuf},
+	str::FromStr, sync::Arc
+};
+
+use anyhow::{Result, Context};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressIterator};
 
 use tokio::{
 	runtime, time, fs, io,
@@ -9,39 +17,40 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use futures_util::future::TryFutureExt;
-use reqwest as http;
+use async_channel;
 
-use anyhow::{self, Result, Context};
-use structopt::{self, StructOpt};
+use reqwest as http;
+use http::header::HeaderValue;
+
+use nix::{sys::time::{TimeVal, TimeValLike}};
 
 use serde::{Deserialize, Serialize};
-use chrono;
-
-use indicatif::{self, ProgressIterator};
+use chrono::{prelude::*, format::Fixed};
 
 
-#[derive(StructOpt, Default)]
-#[structopt(name = "camscrub")]
+
+
+#[derive(Parser, Debug)]
+#[clap(about, version)]
 struct Opt
 {
-	#[structopt()]
-	/// Base URL of the webcam site
-	url: String,
-
-	#[structopt(parse(from_os_str), default_value = ".")]
 	/// Path to download folder
-	download_dir: std::path::PathBuf,
+	#[clap(parse(from_os_str), default_value = ".")]
+	download_dir: PathBuf,
 
-	#[structopt(long("no-dl"))]
-	/// Do not download, only print links
-	list_only: bool,
+	/// Base URL of the webcam site
+	#[clap(default_value = "http://othcam.oth-regensburg.de/webcam/Regensburg/")]
+	url: http::Url,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>>
 {
-	let opt = Opt::from_args();
-	// let opt = Opt { url: "http://othcam.oth-regensburg.de/webcam/".into(), ..Default::default() };
-	let rt = runtime::Builder::new_current_thread()
+	let opt = Opt::parse();
+	if opt.url.cannot_be_a_base() {
+		return Err("URL is not supported".into());
+	}
+
+	let rt = runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()?;
 
@@ -50,42 +59,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
 	Ok(())
 }
 
-async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>>
+async fn run(opt: Opt) -> Result<()>
 {
+	let pb = ProgressBar::new(0)
+		.with_style(indicatif::ProgressStyle::default_bar()
+			.template("{msg} {pos:>6}/{len:6} {elapsed_precise}")
+			.progress_chars("##-"));
+	pb.set_draw_rate(4);
+	let pb = Arc::new(pb);
+
+	let url_base = {
+		let mut url = opt.url.clone();
+		url.path_segments_mut().unwrap().pop_if_empty();
+		url
+	};
+
 	let client = http::Client::builder()
-		.timeout(std::time::Duration::from_secs(10))
+		.timeout(time::Duration::from_secs(10))
 		.build()
 		.context("failed to build http client")?;
 
-	#[derive(Debug, Default, Serialize)]
+	let task_range = 0..4;
+	let (img_tx, img_rx) = async_channel::bounded::<String>(64 * task_range.len());
+	let mut tasks = Vec::new();
+
+	for id in task_range.clone() {
+		let img_rx = img_rx.clone();
+		let pb = pb.clone();
+		let client = client.clone();
+		let url_base = url_base.clone();
+		let download_dir = opt.download_dir.clone();
+
+		let task = tokio::spawn(async move {
+			while let Ok(img) = img_rx.recv().await {
+				if img.is_empty() {
+					break;
+				}
+
+				let img_path = img.clone() + "_hu.jpg";
+				let url = {
+					let mut url = url_base.clone();
+					url.path_segments_mut().unwrap().extend(img_path.split('/'));
+					url
+				};
+				let mut path = download_dir.clone();
+				path.push(&img_path);
+
+				match download(&client, &url, &path).await {
+					Ok(v) => {
+						pb.inc(1);
+						let stat = match v {
+							Status::Downloaded => pb.println(format!("loaded {} ...", img)),
+							Status::Exists => (),
+						};
+					},
+					Err(err) => pb.println(format!("failed to download {}: {}", &img_path, err)),
+				}
+			}
+		});
+		tasks.push(task);
+	}
+
+	#[derive(Serialize)]
 	struct ListRequest {
 		wc: String,
-		img: String,
 		thumbs: u32,
 	}
 
-	#[derive(Debug, Default, Deserialize)]
+	#[derive(Deserialize)]
 	struct ListResponse {
-		image: String,
 		thumbs: Vec<String>,
 	}
 
+	let webcam = url_base.path_segments()
+		.and_then(Iterator::last)
+		.context("missing webcam at the end of URL")?;
 
-	let list_req = ListRequest { wc: "Regensburg".into(), thumbs: 500, ..Default::default() };
+	let url_list = {
+		let mut url = url_base.clone();
+		url.path_segments_mut().unwrap()
+			.pop()
+			.extend(["include", "list.php"]);
+		url
+	};
+	let list_req = ListRequest { wc: webcam.to_owned(), thumbs: 500 };
 
-	let pb = indicatif::ProgressBar::new(1)
-		.with_style(indicatif::ProgressStyle::default_bar()
-			.template("{msg} {wide_bar:.cyan/blue} {pos:>6}/{len:6} [{percent}% {elapsed_precise} --> {eta_precise}]")
-			.progress_chars("##-"));
-	pb.set_draw_rate(4);
-	pb.println(format!("Fetching image URLs for {} @ {} ...", &list_req.wc, &opt.url));
-
-	let mut img_list = BTreeSet::<String>::new();
 	let mut img_oldest = String::new();
-	let list_url = opt.url.clone() + "/include/list.php";
-	let req_base = client.get(list_url)
+	let req_base = client
+		.get(url_list)
 		.query(&list_req);
 
+	pb.println(format!("Searching image URLs in {} ...", &url_base));
 	loop {
 		let res = req_base.try_clone().unwrap()
 			.query(&[("img", &img_oldest)])
@@ -94,87 +158,102 @@ async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>>
 			.json::<ListResponse>()
 			.await.context("failed to parse response")?;
 
-		img_oldest = res.thumbs.first().cloned().unwrap_or_else(|| {
-			pb.println(format!("Oldest image: {}", img_oldest));
-			Default::default()
-		});
-
-		img_list.extend(res.thumbs.into_iter()
+		let img_urls: Vec<_> = res.thumbs.into_iter()
 			.map(|img| img.strip_suffix("_la.jpg")
 				.map(|s| s.to_owned()).unwrap_or(img))
-			.filter(|img| img.ends_with("00")));
+			.collect();
+
+		let img_count = img_urls.len();
+		img_oldest = img_urls.first()
+			.cloned()
+			.unwrap_or_default();
+
+		pb.set_message(format!("search & load... (oldest: {})", img_oldest));
+		pb.inc_length(img_count as _);
+
+		for img_url in img_urls.into_iter() {
+			img_tx.send(img_url)
+				.await.context("failed to distribute image URLs")?;
+		}
 
 		if img_oldest.is_empty() {
+			pb.set_message(format!("loading... (oldest: {})", img_oldest));
 			break;
 		}
-
-		pb.set_message(format!("new oldest: {}", img_oldest));
-		pb.set_length(img_list.len() as u64);
 	}
 
-	if opt.list_only {
-		let mut stdout = io::BufWriter::new(io::stdout());
-		for img in img_list {
-			stdout.write_all(img.as_bytes()).await?;
-			stdout.write_all("\n".as_bytes()).await?;
-		}
-		stdout.flush().await?;
-		return Ok(());
+	// Terminate tasks
+	for id in task_range {
+		img_tx.send(Default::default()).await.ok();
+	}
+	// ..and await their end
+	for task in tasks {
+		task.await.ok();
 	}
 
-	let img_list: Vec<_> = img_list.into_iter().rev().collect();
-	//img_list.sort_by(|a, b| a.cmp(b));
-
-	pb.println(format!("Downloading {} images...", img_list.len()));
-	for img in img_list {
-		pb.set_message(img.clone());
-		match download_img(&client, &opt.download_dir, &http::Url::from_str(&opt.url)?, &list_req.wc, &img).await {
-			Ok(_) => pb.inc(1),
-			Err(err) => pb.println(format!("failed to download {}: {}", &img, err)),
-		}
-	}
-
-	if pb.position() == pb.length() {
-		pb.finish_with_message("Download complete!");
+	let end_msg = if pb.position() == pb.length() {
+		"Download complete!"
 	} else {
-		pb.finish_with_message("Download partially complete!");
-	}
+		"Download partially complete (some errors occurred)!"
+	};
+	pb.finish_with_message(end_msg);
 
 	Ok(())
 }
 
-async fn download_img(client: &http::Client, download_dir: &Path, base_url: &http::Url, webcam: &str, img: &str) -> Result<()>
+enum Status {
+	Downloaded,
+	Exists,
+}
+
+async fn download(client: &http::Client, url: &http::Url, path: &Path) -> Result<Status>
 {
-	let filename = img.to_owned() + "_hu.jpg";
-	let url = base_url.join(&(webcam.to_owned() + "/"))?
-		.join(&filename)?;
-	let response = client.get(url.clone())
+	let mtime = fs::metadata(path).await
+		.and_then(|md| md.modified())
+		.map(DateTime::<Local>::from)
+		.unwrap_or(Local.timestamp(0, 0))
+		.with_timezone(&Utc);
+
+	let resp = client.get(url.clone())
+		.header("If-Modified-Since", mtime.to_rfc2822())
 		.send()
 		.await.context("failed to send download request")?
-		.error_for_status().with_context(|| format!("failed to download {}", &url))?;
+		.error_for_status()
+		.with_context(|| format!("failed to download {}", &url))?;
 
-	let path_file = download_dir.to_owned().join(&webcam).join(&filename);
-	if let Some(len) = response.content_length() {
-		if let Ok(md) = fs::metadata(&path_file).await {
-			if md.len() == len {
-				return Ok(());
-			}
-		}
+	if resp.status() == http::StatusCode::NOT_MODIFIED {
+		return Ok(Status::Exists);
 	}
 
-	let path_dir = path_file.parent().unwrap();
+	let mtime = resp.headers().get("Last-Modified")
+		.context("missing Last-Modified header")
+		.and_then(|hv|  hv.to_str().context("invalid header value"))
+		.and_then(|value| DateTime::parse_from_rfc2822(&value)
+				.map(|dt| dt.with_timezone(&Utc))
+				.context("invalid modify time"))
+		.unwrap_or_else(|_| Utc::now());
+
+	let path_dir = path.parent().unwrap();
 	fs::create_dir_all(&path_dir).await
 		.with_context(|| format!("failed to create directory {}", path_dir.display()))?;
 
-	let mut file = fs::File::create(&path_file).await
-		.with_context(|| format!("failed to create image file {}", path_file.display()))?;
+	let mut file = fs::File::create(path).await
+		.with_context(|| format!("failed to create image file {}", path.display()))?;
 
-	let mut stream = response.bytes_stream();
+	if let Some(len) = resp.content_length() {
+		file.set_len(len).await.ok();
+	}
+
+	let mut stream = resp.bytes_stream();
 	while let Some(chunk) = stream.next().await {
 		file.write_all_buf(&mut chunk?).await
 			.context("failed to write")?;
 	}
 	file.flush().await.context("failed to flush")?;
 
-	Ok(())
+	// set modification date from server
+	let tv = TimeVal::milliseconds(mtime.timestamp_millis());
+	nix::sys::stat::utimes(path, &tv, &tv).ok();
+
+	Ok(Status::Downloaded)
 }
